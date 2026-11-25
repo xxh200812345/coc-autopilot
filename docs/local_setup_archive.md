@@ -112,3 +112,37 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall_task.ps1
 ## 6. 重启后回到 Antigravity 对话 Session
 * **桌面端 / IDE**：打开软件后在左侧边栏历史对话列表点击本对话（可 Pin 置顶或 Star 标星）。
 * **CLI (`agy`)**：运行 `agy` 后输入 `/resume`（或 `agy --resume`），选择 ID `7bcb8620-0537-429d-bd77-a2935c677505`。
+
+---
+
+## 7. 后续实测追踪与深度睡眠专题（2026-11-26 早间更新）
+
+### 7.1 `2026-11-26 07:54` 补跑实测记录
+* **收菜结果**：金币 `+513,030`（`2,895,857 → 3,408,887`），圣水 `+534,468`（`2,314,900 → 2,849,368`），暗黑 `84,321`，总耗时 `209s`。
+* **已验证修复**：
+  * 中文日志与 `summary.log` 摘要完全清晰无乱码；
+  * 防打扰逻辑正确识别 `启动空闲=0s 电脑原已开机=True`，记为 `power=Sleep(skipped:pc-already-on)`，未误睡正在使用的电脑。
+* **新发现小 Bug（待后续按需修）**：
+  * 有 3 个空闲工人时，建筑列表把 **`建筑工人小屋（2,000 宝石，买第 5 工人）`** 误判为 `gold` 并因价格最低排首位；连点 2 次未弹出「升至」确认框（被安全闸拦截，**未花宝石**），但导致本轮跳过升级、未能升级后面的 `骷髅陷阱×2` / `暗黑重油钻井`。
+  * 后续可在 `coc_patrol2.py` 里把 `建筑工人小屋` 加入跳过名单，或修正 `_kind_at()` 对绿色宝石图标的过滤。
+
+### 7.2 结合本机型号的深度睡眠（S0）未唤醒分析与对策
+* **本机硬件信息**：
+  * 整机型号：**Alienware Aurora R16**
+  * 主板：`Alienware 0RF96M`（Rev `A02`），BIOS：`2.25.0`（`07/07/2026`）
+  * 系统：Windows 11 Pro `25H2`（Build `26200`）
+* **现象复盘**：
+  * `powercfg /waketimers` 确认 Windows 已正确注册 `CoC-Autopilot` 的唤醒计时器（如 `9:59:30`）；
+  * 仅睡 1 分钟（浅度 S0）时成功自动唤醒，但 `03:26` 进入长时间深度 S0（DRIPS）后，`04:00` 未被拉起，直到 `07:54:51` 手动唤醒后才由 `StartWhenAvailable` 补跑。
+* **根因（结合 Aurora R16 特性与 Windows 11 调研）**：
+  1. **Aurora R16 固件原生锁定 S0 Modern Standby**：Dell/Alienware 在 Aurora R16 BIOS 中彻底移除了经典 S3 切换开关（切勿用第三方 EFI 工具强改 S3，易导致唤醒死机）。
+  2. **Windows 11 S0 深度空闲（DRIPS）抑制低权限自定义计时器**：在现代待机进入深度 DRIPS 后，微软经常抑制 `RunLevel=Limited` 的普通计划任务唤醒，优先保低功耗。
+  3. **Aurora R16 BIOS `Deep Sleep Control`**：位于 BIOS → `Power Options`，默认为 `Enabled in S4 and S5`（深度节能切断 S4/S5 辅助供电）。
+* **后续可选解决路径（按优先级）**：
+  1. **优先尝试（继续用纯睡眠 S0、不写硬盘）**：以管理员身份重装定时任务，将 `CoC-Autopilot` 的权限从 `Limited` 提升到 **`Highest`（最高权限）**，观察睡眠超过 1 小时能否准点拉起；同时检查网卡属性中勾选「允许此设备唤醒计算机」防止 S0 锁死系统定时器。
+  2. **最稳备选（Aurora R16 社区公认方案：改用 `Hibernate` 休眠 S4）**：
+     * S4 休眠走硬件级 RTC 唤醒，不受 Windows 11 S0 吞计时器影响，且风扇与 AlienFX 氛围灯 100% 彻底断电；
+     * 一天 3 次休眠年写入量仅约 5~9 TB，对现代 600TBW+ NVMe SSD 影响极小；
+     * 若切到休眠，建议进 BIOS → `Power Options` 将 **`Deep Sleep Control` 设为 `Disabled`**，避免切断 S4 唤醒电路。
+  3. **其他备选**：保持系统仅熄屏不睡眠，或使用内核级 S0 唤醒转发工具（如 `Modern Wakeup`）。
+

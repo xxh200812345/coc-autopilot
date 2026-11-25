@@ -1162,8 +1162,10 @@ def _kind_at(im, py):
     bright = hsv[(hsv[:, 1] > 120) & (hsv[:, 2] > 140)]
     if len(bright) >= 15:
         h = float(np.median(bright[:, 0]))
-        if 15 <= h <= 45:
+        if 15 <= h <= 35:
             return "gold"
+        if 40 <= h <= 88:
+            return "gems"
         if 120 <= h <= 170:
             return "elixir"
     if float(np.median(hsv[:, 2])) < 130 and float(np.median(hsv[:, 1])) < 130:
@@ -1290,6 +1292,8 @@ def upgrade_from_list(max_price=None, kinds=("gold", "elixir"), dry=False, items
 
         picked = None
         for it in pool:
+            if "工人小屋" in it["name"] and it["price"] <= 5000:
+                continue                        # 500/1000/2000 的建筑工人小屋花的是宝石，跳过
             if max_price and it["price"] > max_price:
                 continue
             if it["price"] > budget.get(it["kind"], 0) * 0.9:

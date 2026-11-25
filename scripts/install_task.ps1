@@ -29,10 +29,13 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
 
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$runLevel = if ($isAdmin) { "Highest" } else { "Limited" }
+
 $principal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
     -LogonType Interactive `
-    -RunLevel Limited
+    -RunLevel $runLevel
 
 Register-ScheduledTask `
     -TaskName $TaskName `
@@ -44,8 +47,12 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Write-Host "已注册定时任务: $TaskName" -ForegroundColor Green
-Write-Host "  每日时间点 : $($Times -join ', ')"
+Write-Host "  每日时间点 : $($timeList -join ', ')"
 Write-Host "  结束后动作 : $PowerAction"
+Write-Host "  运行权限   : $runLevel"
 Write-Host "  唤醒定时器 : 已启用 (WakeToRun=True)"
+if (-not $isAdmin) {
+    Write-Host "提示：当前非管理员权限，已使用 Limited。若 S0 深度睡眠下无法唤醒，请以管理员运行本脚本提升为 Highest。" -ForegroundColor Yellow
+}
 Write-Host ""
 Write-Host "提示：请确认 Windows 电源选项中「睡眠 -> 允许使用唤醒定时器」为【启用】。" -ForegroundColor Yellow
