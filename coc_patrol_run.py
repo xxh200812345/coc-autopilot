@@ -29,12 +29,16 @@
                                                    # 只在「应该跑」的窗口里把登录页/遮罩当问题报
 """
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 
 import cv2
@@ -44,7 +48,7 @@ sys.path.insert(0, HERE)
 import coc_config
 
 # cron 那行是 `flock -n /tmp/coc_patrol.lock python ...`，手动跑也要抢同一把锁。
-LOCK_PATH = "/tmp/coc_patrol.lock"
+LOCK_PATH = "/tmp/coc_patrol.lock" if os.name != "nt" else os.path.join(tempfile.gettempdir(), "coc_patrol.lock")
 _lock_fd = None
 
 
@@ -69,6 +73,8 @@ def take_lock(path=LOCK_PATH, probe=False):
     外层 flock 继续负责 cron 之间的互斥，lockf 负责「手动跑 vs cron vs 登录态巡检」互斥。
     """
     global _lock_fd
+    if fcntl is None:
+        return True, "Windows 无 fcntl，跳过文件锁"
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
     except OSError as e:
@@ -658,7 +664,7 @@ def main():
     # 定位那三级搜索是唯一能把一轮拖到十几分钟的地方（不拦就是游戏挂一晚白烧屏幕）。
     limit = int(cfg.get("round_max_s") or 0)
     armed = False
-    if limit > 0:
+    if limit > 0 and hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
         signal.signal(signal.SIGALRM, _on_alarm)
         signal.setitimer(signal.ITIMER_REAL, limit)
         armed = True
