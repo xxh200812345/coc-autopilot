@@ -1,6 +1,8 @@
 ﻿param(
     [double]$Minutes = 120,
     [double]$Jitter = 10,
+    [double]$ShortMaxMin = 10,
+    [switch]$ShortOnly,
     [int]$VmIndex = 0,
     [switch]$Dry,
     [switch]$KeepEmulator,
@@ -180,7 +182,8 @@ try {
         Write-Log "检测到游戏本来就在运行 (pid=$gamePid)，跳过值守（不启动、不关闭、不操作）"
     } else {
         Start-Sleep -Seconds 3
-        $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter")
+        $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter", "--short-max-min", "$ShortMaxMin")
+        if ($ShortOnly) { $pyArgs += "--short-only" }
         if ($Dry) { $pyArgs += "--dry" }
         if ($KeepGame) { $pyArgs += "--keep-game" }
         Write-Log "执行: $Python $($pyArgs -join ' ')"
