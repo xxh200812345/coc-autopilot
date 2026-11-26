@@ -29,9 +29,41 @@ import coc_patrol2 as p
 
 LOGIN_WORDS = ("QQ登录", "微信登录", "用户协议", "隐私政策", "同意并继续",
                "实名认证", "切换账号", "授权登录", "登录游戏", "游客登录")
+CAPTURE_PREF_PATH = os.path.join(REPO_DIR, "logs", "capture_pref.json")
 _DUR_EXTRACT_RE = re.compile(
     r"((?:\d+\s*天\s*)?(?:\d+\s*小时\s*)?(?:\d+\s*分钟\s*)?(?:\d+\s*秒)?)"
 )
+
+
+def init_capture_smart():
+    """自适应抓帧优先级：首次探测成功谁就记住谁（存 logs/capture_pref.json），下次直连不再反复握手失败。"""
+    import json
+    pref = None
+    try:
+        with open(CAPTURE_PREF_PATH, "r", encoding="utf-8") as f:
+            pref = (json.load(f) or {}).get("mode")
+    except Exception:
+        pref = None
+
+    if pref == "screencap":
+        p._mc = None
+        p._mc_tried = True
+        p._mc_fail = 99
+        p.log("[capture] 已按历史优先级直连 screencap（跳过 minicap 探测）")
+        return "screencap"
+
+    ok = p.init_capture()
+    mode = "minicap" if ok else "screencap"
+    if not ok:
+        p._mc_fail = 99   # 立刻锁定 screencap，避免 grab() 再重复尝试 3 次
+    try:
+        os.makedirs(os.path.dirname(CAPTURE_PREF_PATH), exist_ok=True)
+        with open(CAPTURE_PREF_PATH, "w", encoding="utf-8") as f:
+            json.dump({"mode": mode, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+        p.log(f"[capture] 已记录高优先级抓帧模式: {mode} -> logs/capture_pref.json")
+    except Exception:
+        pass
+    return mode
 
 
 def extract_duration_sec(text):
@@ -380,7 +412,7 @@ def main():
         f"[watch] 启动智能排程值守: 窗口={total_min:.1f}分钟 "
         f"短任务优先<={int(args.short_max_min)}分钟 short_only={args.short_only} dry={args.dry}"
     )
-    p.init_capture()
+    init_capture_smart()
 
     tracked_builds = []
     total_collected = 0
