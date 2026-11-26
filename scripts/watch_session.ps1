@@ -1,7 +1,7 @@
 ﻿param(
     [double]$Minutes = 120,
     [double]$Jitter = 10,
-    [double]$ShortMaxMin = 10,
+    [double]$ShortMaxMin = 30,
     [switch]$ShortOnly,
     [int]$VmIndex = 0,
     [switch]$Dry,

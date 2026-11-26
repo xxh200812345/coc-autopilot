@@ -396,7 +396,7 @@ def main():
     ap = argparse.ArgumentParser(description="CoC 智能工人排程值守（优先做完 <=10 分钟短任务，按完工时间精准操作）")
     ap.add_argument("--minutes", type=float, default=120.0, help="总值守窗口（分钟，默认 120）")
     ap.add_argument("--jitter", type=float, default=10.0, help="总时长随机浮动分钟数（默认 ±10）")
-    ap.add_argument("--short-max-min", type=float, default=10.0, help="优先短任务阈值（分钟，默认 10）")
+    ap.add_argument("--short-max-min", type=float, default=30.0, help="优先短任务阈值（分钟，默认 30）")
     ap.add_argument("--short-only", action="store_true", help="只做 <= short-max-min 的短任务，不升长任务")
     ap.add_argument("--dry", action="store_true", help="只读演练，不点击确认")
     ap.add_argument("--keep-game", action="store_true", help="结束时不强杀游戏")
