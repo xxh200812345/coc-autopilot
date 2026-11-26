@@ -172,36 +172,31 @@ try {
     }
     if (-not $adbReady) { throw "等待 ADB 就绪超时 ($serial)" }
 
-    # 4. 如果游戏本来就在运行，直接跳过不打扰
+    # 4. 接替模式：无论游戏是否已在运行，直接接管进入智能排程值守
     $gamePid = (& adb -s $serial shell pidof $pkg 2>$null | Out-String).Trim()
     if ($gamePid) {
-        $gameWasRunning = $true
-        $status = "SKIP"
-        $note = "game-already-running(pid=$gamePid)"
-        $rc = 0
-        Write-Log "检测到游戏本来就在运行 (pid=$gamePid)，跳过值守（不启动、不关闭、不操作）"
-    } else {
-        Start-Sleep -Seconds 3
-        $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter", "--short-max-min", "$ShortMaxMin")
-        if ($ShortOnly) { $pyArgs += "--short-only" }
-        if ($Dry) { $pyArgs += "--dry" }
-        if ($KeepGame) { $pyArgs += "--keep-game" }
-        Write-Log "执行: $Python $($pyArgs -join ' ')"
-        Push-Location $RepoDir
-        try {
-            & $Python @pyArgs 2>&1 | ForEach-Object {
-                $s = "$_"
-                Write-Host $s
-                Add-Content -Path $RunLog -Value $s -Encoding UTF8
-                if ($s -match "最终 |值守完成:") { $finalLine = $s }
-            }
-            $rc = $LASTEXITCODE
-        } finally {
-            Pop-Location
-        }
-        if ($rc -eq 0) { $status = "OK" } else { $status = "FAIL"; $note = "exit=$rc" }
-        Write-Log "值守结束，状态=$status 退出码=$rc"
+        Write-Log "检测到游戏已在运行 (pid=$gamePid)，直接接管开始值守"
     }
+    Start-Sleep -Seconds 2
+    $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter", "--short-max-min", "$ShortMaxMin")
+    if ($ShortOnly) { $pyArgs += "--short-only" }
+    if ($Dry) { $pyArgs += "--dry" }
+    if ($KeepGame) { $pyArgs += "--keep-game" }
+    Write-Log "执行: $Python $($pyArgs -join ' ')"
+    Push-Location $RepoDir
+    try {
+        & $Python @pyArgs 2>&1 | ForEach-Object {
+            $s = "$_"
+            Write-Host $s
+            Add-Content -Path $RunLog -Value $s -Encoding UTF8
+            if ($s -match "最终 |值守完成:") { $finalLine = $s }
+        }
+        $rc = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($rc -eq 0) { $status = "OK" } else { $status = "FAIL"; $note = "exit=$rc" }
+    Write-Log "值守结束，状态=$status 退出码=$rc"
 }
 catch {
     $status = "ERROR"

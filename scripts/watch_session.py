@@ -2,19 +2,19 @@
 """CoC 智能工人排程值守扩展（非侵入式：仅调用上游 coc_patrol2 / coc_config / coc_duration）。
 
 核心思路（不做无意义的防掉线划屏，掉了就重新载入/重开）：
-1. 读取建筑列表顶部的「正在升级」倒计时 + 本次会话派出的施工记录，记住每个工人的预计完工时间；
-2. 有空闲工人时，按候选列表检查升级时长（从确认页读取「升级时间」，并缓存到 logs/upgrade_durations.json 避免重复点开）：
-   - 优先把耗时 <= short_max_min（默认 10 分钟）的短任务全部按时长从短到长做完；
-   - 短任务都做完后，如未开启 --short-only，再按时长从短到长（其次按价格）派长任务；
-3. 工人全部派满后，精确休眠到「最早完工的工人时间 + 20~45 秒随机缓冲」（不干等、不乱划屏）；
-4. 到点醒来时若游戏已掉线（「还在吗？」弹窗或进程退出），自动点重新载入或重新拉起游戏进村；
-5. 若所有工人的完工时间都超出本次值守窗口（默认 ~2 小时），则提前体面收工，不白挂机。
+1. 直接解析建筑列表的上下两区（以「临时工人 / 排队建造」行为分界）：
+   - 上半区：正在施工的建筑剩余倒计时（自动排除「实验室」研究，避免干扰工人完工判断）；
+   - 下半区：可升级建筑的 名称 + 升级时长 + 价格（支持 <1000 的低级建筑，如 350/375/750）+ 币种；
+2. 有空闲工人时，直接按时长从短到长优先做完 <= short_max_min（默认 10 分钟）的短任务；
+   短任务做完后（若未开 --short-only）再按时长从短到长升长任务；
+3. 工人全部派满后，精确静默等待到「最早完工的工人时间 + 15~30 秒随机缓冲」；
+4. 到点时若游戏已掉线（「还在吗？」或退出），自动点重新载入或重启游戏进村；
+5. 若所有工人的完工时间都超出本次值守窗口，则提前体面收工，不白挂机。
 """
 import argparse
-import json
 import os
-import re
 import random
+import re
 import sys
 import time
 
@@ -29,92 +29,140 @@ import coc_patrol2 as p
 
 LOGIN_WORDS = ("QQ登录", "微信登录", "用户协议", "隐私政策", "同意并继续",
                "实名认证", "切换账号", "授权登录", "登录游戏", "游客登录")
-DUR_CACHE_PATH = os.path.join(REPO_DIR, "logs", "upgrade_durations.json")
 _DUR_EXTRACT_RE = re.compile(
     r"((?:\d+\s*天\s*)?(?:\d+\s*小时\s*)?(?:\d+\s*分钟\s*)?(?:\d+\s*秒)?)"
 )
 
 
-def load_dur_cache():
-    try:
-        with open(DUR_CACHE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_dur_cache(cache):
-    try:
-        os.makedirs(os.path.dirname(DUR_CACHE_PATH), exist_ok=True)
-        with open(DUR_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
 def extract_duration_sec(text):
-    """从 OCR 文本中提取最合理的升级/倒计时秒数（支持「升级时间 5分钟」「1天2小时」等）。"""
+    """从 OCR 文本中提取升级/倒计时秒数（如 '1分钟14秒' -> 74, '36分钟1秒' -> 2161）。"""
     if not text:
         return None
     s = str(text).strip()
     if not any(u in s for u in ("天", "小时", "分钟", "秒")):
         return None
-    # 先尝试整串解析
     val = dur.parse_duration(s)
     if val is not None and val > 0:
         return val
-    # 再从长句里抠出时长片段（例如「升级时间 10分钟」）
     best = None
     for m in _DUR_EXTRACT_RE.finditer(s):
         part = m.group(1).strip()
         if not part or not any(u in part for u in ("天", "小时", "分钟", "秒")):
             continue
         v = dur.parse_duration(part)
-        if v is not None and v > 0:
-            if best is None or v > best:
-                best = v
+        if v is not None and v > 0 and (best is None or v > best):
+            best = v
     return best
 
 
-def read_in_progress_countdowns(im):
-    """从建筑列表图里读出所有正在施工建筑的剩余秒数列表。"""
+def parse_build_list_full(im):
+    """一次性解析建筑列表的上下两区 -> (in_progress_list, available_items)。
+
+    in_progress_list: [{"name", "remaining_s", "y"}]（仅在建建筑，已排除实验室）
+    available_items : [{"name", "price", "kind", "duration_s", "y"}]（支持低价 <1000）
+    """
     if im is None:
-        return []
-    tx = p.ocr_all(im, (1680, 50, 2220, 1010))
-    out = []
-    for t in tx:
-        txt = t.get("t", "")
-        if any(u in txt for u in ("天", "小时", "分钟", "秒")):
-            sec = extract_duration_sec(txt)
-            if sec is not None and 5 <= sec <= 30 * 86400:
-                out.append(sec)
-    out.sort()
-    return out
+        return [], []
+    tx = p.ocr_all(im, (1600, 50, 2220, 1010))
+    if not tx:
+        return [], []
 
+    # 1. 找上下半区分界 y（「临时工人」「排队建造」那一行）
+    split_ys = [
+        t["y"] for t in tx
+        if any(k in t["t"] for k in ("临时工人", "排队建造", "建议升级"))
+    ]
+    if split_ys:
+        y_split = max(split_ys) + 18
+    else:
+        # 兜底：若存在「工人空闲中」，取它下方 75px；否则按第一条纯数字价格反推
+        idle_ys = [t["y"] for t in tx if "工人空闲" in t["t"]]
+        if idle_ys:
+            y_split = max(idle_ys) + 75
+        else:
+            y_split = 420
 
-def read_confirm_duration(cf_img):
-    """从升级确认页截图中读取「升级时间」秒数。"""
-    if cf_img is None:
-        return None
-    # 确认页下半部及中下部常显示升级时间（如「10分钟」「2天1小时」）
-    tx = p.ocr_all(cf_img, (400, 480, 1950, 1040))
-    cands = []
+    # 2. 上半区（y < y_split）：在建倒计时
+    top_names = []
+    top_durs = []
     for t in tx:
-        sec = extract_duration_sec(t.get("t", ""))
-        if sec is not None and 1 <= sec <= 30 * 86400:
-            cands.append((t.get("y", 0), sec, t.get("t", "")))
-    if not cands:
-        # 兜底全图扫一次
-        for t in p.ocr_all(cf_img):
-            sec = extract_duration_sec(t.get("t", ""))
-            if sec is not None and 1 <= sec <= 30 * 86400:
-                cands.append((t.get("y", 0), sec, t.get("t", "")))
-    if not cands:
-        return None
-    # 通常升级时间在确认按钮附近或卡片中下区
-    cands.sort(key=lambda z: -z[0])
-    return cands[0][1]
+        if t["y"] >= y_split:
+            continue
+        txt = t["t"].strip()
+        if any(k in txt for k in ("工人空闲", "临时工人", "排队建造", "升级中")):
+            continue
+        sec = extract_duration_sec(txt)
+        if sec is not None and t["x"] >= 2000:
+            top_durs.append((sec, t["y"], txt))
+        elif t["x"] < 2000 and len(txt) >= 2:
+            top_names.append(t)
+
+    in_progress = []
+    for sec, dy, raw_t in top_durs:
+        cand = [n for n in top_names if abs(n["y"] - dy) < 28]
+        name = min(cand, key=lambda n: abs(n["y"] - dy))["t"].strip() if cand else "施工中"
+        # 实验室不占建筑工人，不计入工人最早完工时间
+        if "实验室" in name:
+            continue
+        in_progress.append({"name": name, "remaining_s": sec, "y": dy, "raw": raw_t})
+    in_progress.sort(key=lambda z: z["remaining_s"])
+
+    # 3. 下半区（y >= y_split）：可升级建筑（名称 + 时长 + 价格 + 币种）
+    bot_names = []
+    bot_durs = []
+    bot_prices = []
+    for t in tx:
+        if t["y"] < y_split:
+            continue
+        txt = t["t"].strip()
+        if any(k in txt for k in ("临时工人", "排队建造", "建议升级")):
+            continue
+        sec = extract_duration_sec(txt)
+        if sec is not None and t["x"] >= 2000:
+            bot_durs.append((sec, t["y"], txt))
+            continue
+        digits = "".join(c for c in txt if c.isdigit())
+        if t["x"] >= 2040 and len(digits) >= 2 and digits == txt.replace(",", "").replace(" ", ""):
+            bot_prices.append((int(digits), t["x"], t["y"]))
+            continue
+        if t["x"] < 2000 and len(txt) >= 2 and not txt.replace("×", "").isdigit():
+            bot_names.append(t)
+
+    items = []
+    used_names = set()
+    used_durs = set()
+    for price, px, py in bot_prices:
+        if price < 100:
+            continue
+        # 价格通常在建筑名下方 15~40px，也可能与建筑名同行
+        ncands = [n for n in bot_names if -15 <= (py - n["y"]) <= 48 and id(n) not in used_names]
+        if not ncands:
+            continue
+        n = min(ncands, key=lambda z: abs(py - z["y"] - 25))
+        used_names.add(id(n))
+
+        # 找同行的升级时长（在价格正上方约 20~40px，与建筑名同行）
+        dcands = [
+            (idx, sec, dy) for idx, (sec, dy, _) in enumerate(bot_durs)
+            if idx not in used_durs and abs(dy - n["y"]) < 26
+        ]
+        duration_s = None
+        if dcands:
+            best_d = min(dcands, key=lambda z: abs(z[2] - n["y"]))
+            used_durs.add(best_d[0])
+            duration_s = best_d[1]
+
+        kind = p._kind_at(im, py)
+        items.append({
+            "name": n["t"].strip(),
+            "price": price,
+            "kind": kind,
+            "duration_s": duration_s,
+            "y": n["y"],
+            "price_y": py,
+        })
+
+    return in_progress, items
 
 
 def ensure_in_village():
@@ -144,7 +192,6 @@ def ensure_in_village():
     if img is not None:
         return "ok"
 
-    # 恢复不了就强杀重开一次
     p.log("[watch] 恢复进村失败，重启游戏再试...")
     p.sh(f"am force-stop {p.PKG}")
     time.sleep(1.5)
@@ -191,7 +238,8 @@ def confirm_upgrade_now(cf, item, budget, w_start):
     """在确认页点击绿色确认并校验扣款/工人数变化，返回 True/False。"""
     btn = p.find_green_button(cf)
     pos = (btn[0], btn[1]) if btn else p.CONFIRM_BTN
-    p.log(f"[watch] 确认升级 {item['name']} ({item['price']:,} {item['kind']}) @{pos}")
+    dur_txt = dur.fmt_duration(item["duration_s"]) if item.get("duration_s") else "?"
+    p.log(f"[watch] 确认升级 {item['name']} ({item['price']:,} {item['kind']}, 时长={dur_txt}) @{pos}")
     for _ in range(3):
         p.tap(pos[0], pos[1], 1.3)
         time.sleep(1.0)
@@ -210,7 +258,6 @@ def confirm_upgrade_now(cf, item, budget, w_start):
     cur = res1.get(item["kind"]) if res1 else None
     spent = (budget.get(item["kind"], 0) - cur) if cur is not None else None
     paid = (item["price"] > 0 and spent is not None and spent >= item["price"] * 0.85)
-    # 注意：read_workers 返回 (空闲, 总数)，派出去 1 个工人后空闲数减少
     worker_used = (
         w_start and w1 and w_start[0] is not None and w1[0] is not None
         and w1[0] < w_start[0]
@@ -223,20 +270,24 @@ def confirm_upgrade_now(cf, item, budget, w_start):
     return False
 
 
-def pick_and_upgrade_short_first(cfg, res_now, w_now, dur_cache, short_max_s, short_only=False, dry=False):
-    """优先挑选 <= short_max_s（默认 10 分钟）的建筑升级。
+def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=False, dry=False):
+    """从建筑列表直接按「时长 <= short_max_s 最短优先」挑一个升级。
 
-    返回 (upgraded_record_or_None, in_progress_countdowns)。
-    upgraded_record = dict(name, price, kind, duration_s, finish_ts)
+    返回 (upgraded_record_or_None, in_progress_list)。
     """
     bl = p.open_build_list()
     if bl is None:
         return None, []
-    countdowns = read_in_progress_countdowns(bl)
-    items = p.read_build_list(bl)
+    in_progress, items = parse_build_list_full(bl)
+    if in_progress:
+        p.log(
+            "[watch] 正在施工: "
+            + ", ".join(f"{b['name']}({dur.fmt_duration(b['remaining_s'])})" for b in in_progress)
+        )
     if not items:
         p.clear_panels()
-        return None, countdowns
+        p.log("[watch] 建筑列表未解析到可升级项")
+        return None, in_progress
 
     kinds = tuple(cfg.get("upgrade_kinds") or ("gold", "elixir"))
     max_price = cfg.get("max_price")
@@ -256,133 +307,57 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, dur_cache, short_max_s, sh
             continue
         if it["price"] > budget.get(it["kind"], 0) * 0.95:
             continue
-        key = f"{it['name']}|{it['price']}"
-        cached_s = dur_cache.get(key)
-        it_copy = dict(it)
-        it_copy["cache_key"] = key
-        it_copy["duration_s"] = cached_s
-        pool.append(it_copy)
+        if short_only and (it["duration_s"] is None or it["duration_s"] > short_max_s):
+            continue
+        pool.append(it)
 
     if not pool:
         p.clear_panels()
-        return None, countdowns
+        p.log("[watch] 无符合预算/时长条件的可升级项")
+        return None, in_progress
 
-    # 排序：已知 <=short_max_s 最优先（按时长升序）；其次未知时长（按价格升序，便宜的往往耗时短）；最后已知长任务（按时长升序）
+    # 排序：<=short_max_s 最优先（按时长升序），其次按时长升序，最后按价格升序
     def _rank(it):
         ds = it["duration_s"]
         if ds is not None and ds <= short_max_s:
             return (0, ds, it["price"])
-        if ds is None:
-            return (1, it["price"], 0)
-        return (2, ds, it["price"])
+        if ds is not None:
+            return (1, ds, it["price"])
+        return (2, it["price"], 0)
 
     pool.sort(key=_rank)
     p.log(
         "[watch] 可升级候选(短任务优先): "
         + ", ".join(
             f"{i['name']}({i['price']:,},{i['kind']},"
-            f"{dur.fmt_duration(i['duration_s']) if i['duration_s'] else '时长待测'})"
+            f"{dur.fmt_duration(i['duration_s']) if i['duration_s'] else '?'})"
             for i in pool[:5]
         )
     )
 
+    chosen = pool[0]
     if dry:
         p.clear_panels()
-        chosen = pool[0]
-        p.log(f"[watch] [dry] 优先候选: {chosen['name']} ({chosen['price']:,} {chosen['kind']})")
-        return None, countdowns
+        p.log(f"[watch] [dry] 将优先升级: {chosen['name']} ({chosen['price']:,} {chosen['kind']})")
+        return None, in_progress
 
-    # 最多探查前 4 个候选，找到 <=short_max_s 的立刻升；否则选探到最短的（若未开 short_only）
-    best_long = None  # (duration_s, item)
-    for idx, it in enumerate(pool[:4]):
-        # 如果已经没有短任务且当前项已知 > short_max_s
-        if it["duration_s"] is not None and it["duration_s"] > short_max_s:
-            if short_only:
-                break
-            if best_long is None or it["duration_s"] < best_long[0]:
-                best_long = (it["duration_s"], it)
-            break
-
-        if idx > 0:
-            # 重新打开列表确保行位置有效
-            bl2 = p.open_build_list()
-            if bl2 is None:
-                break
-            fresh = p.read_build_list(bl2)
-            match = next(
-                (x for x in fresh if x["name"] == it["name"] and x["price"] == it["price"]),
-                None,
-            )
-            if not match:
-                continue
-            it["y"] = match["y"]
-
-        cf = open_confirm_for_item(it)
-        if cf is None:
-            p.clear_panels()
-            continue
-
-        sec = read_confirm_duration(cf)
-        if sec is not None:
-            dur_cache[it["cache_key"]] = sec
-            save_dur_cache(dur_cache)
-            it["duration_s"] = sec
-            p.log(f"[watch] 测得时长: {it['name']} = {dur.fmt_duration(sec)} ({sec}s)")
-
-        # 命中短任务（<= short_max_s）→ 立刻确认升级！
-        if sec is not None and sec <= short_max_s:
-            ok = confirm_upgrade_now(cf, it, budget, w_now)
-            if ok:
-                return dict(
-                    name=it["name"],
-                    price=it["price"],
-                    kind=it["kind"],
-                    duration_s=sec,
-                    finish_ts=time.time() + sec,
-                ), countdowns
-            continue
-
-        # 不是短任务：记进备选长任务，关闭确认框继续看下一项有没有短任务
-        if sec is not None:
-            if best_long is None or sec < best_long[0]:
-                best_long = (sec, it)
-        elif best_long is None:
-            best_long = (999999, it)
-        p.clear_panels()
-        time.sleep(0.6)
-
-    # 没有 <= short_max_s 的短任务了
-    if short_only or best_long is None:
-        p.clear_panels()
-        if short_only:
-            p.log(f"[watch] 当前没有 <= {short_max_s // 60} 分钟的短任务（--short-only），本轮不升长任务")
-        return None, countdowns
-
-    # 升级最短的长任务
-    sec, it = best_long
-    bl3 = p.open_build_list()
-    if bl3 is None:
-        return None, countdowns
-    fresh = p.read_build_list(bl3)
-    match = next((x for x in fresh if x["name"] == it["name"] and x["price"] == it["price"]), None)
-    if not match:
-        p.clear_panels()
-        return None, countdowns
-    cf = open_confirm_for_item(match)
+    cf = open_confirm_for_item(chosen)
     if cf is None:
         p.clear_panels()
-        return None, countdowns
-    ok = confirm_upgrade_now(cf, match, budget, w_now)
+        p.log(f"[watch] 未弹出 {chosen['name']} 确认框")
+        return None, in_progress
+
+    ok = confirm_upgrade_now(cf, chosen, budget, w_now)
     if ok:
-        est_s = sec if sec < 999999 else None
+        ds = chosen.get("duration_s")
         return dict(
-            name=match["name"],
-            price=match["price"],
-            kind=match["kind"],
-            duration_s=est_s,
-            finish_ts=(time.time() + est_s) if est_s else None,
-        ), countdowns
-    return None, countdowns
+            name=chosen["name"],
+            price=chosen["price"],
+            kind=chosen["kind"],
+            duration_s=ds,
+            finish_ts=(time.time() + ds) if ds else None,
+        ), in_progress
+    return None, in_progress
 
 
 def main():
@@ -396,7 +371,6 @@ def main():
     args = ap.parse_args()
 
     cfg = coc_config.load()
-    dur_cache = load_dur_cache()
     short_max_s = int(args.short_max_min * 60)
     total_min = max(1.0, args.minutes + random.uniform(-args.jitter, args.jitter))
     t0 = time.time()
@@ -408,7 +382,7 @@ def main():
     )
     p.init_capture()
 
-    tracked_builds = []  # [{"name": ..., "finish_ts": ..., "duration_s": ...}]
+    tracked_builds = []
     total_collected = 0
     total_upgrades = []
     res_start = None
@@ -426,7 +400,6 @@ def main():
                 time.sleep(min(60, max(1, end_ts - time.time())))
                 continue
 
-            # 1. 收气泡 + 读资源和工人
             ok_c, tot_c, res_now = collect_bubbles_once(cfg, dry=args.dry)
             total_collected += ok_c
             if res_start is None and res_now:
@@ -437,24 +410,21 @@ def main():
             free_w = w_now[0] if (w_now and w_now[0] is not None) else 0
             p.log(f"[watch] 第 {round_no} 轮 | 收气泡 {ok_c}/{tot_c} | 资源={res_now} | 工人={w_now}")
 
-            # 清理已到期的本地追踪记录
             now = time.time()
             tracked_builds = [b for b in tracked_builds if b.get("finish_ts") and b["finish_ts"] > now - 10]
 
-            # 2. 如果有空闲工人，尽量把空闲工位填满（短任务优先）
-            countdowns = []
+            in_progress = []
             min_free = int(cfg.get("min_free_workers") or 1)
             if cfg.get("upgrade", True) and free_w >= min_free:
-                # 最多循环派出当前所有空闲工人
                 for _slot in range(free_w):
                     if time.time() >= end_ts:
                         break
-                    rec, cds = pick_and_upgrade_short_first(
-                        cfg, res_now, w_now, dur_cache, short_max_s,
+                    rec, ip = pick_and_upgrade_short_first(
+                        cfg, res_now, w_now, short_max_s,
                         short_only=args.short_only, dry=args.dry,
                     )
-                    if cds:
-                        countdowns = cds
+                    if ip:
+                        in_progress = ip
                     if not rec:
                         break
                     total_upgrades.append(rec)
@@ -464,7 +434,6 @@ def main():
                         p.log(f"[watch] 已记排程: {rec['name']} 预计 {eta} 完工")
                     if args.dry:
                         break
-                    # 刷新资源和工人数
                     res_now = p.read_res_vote(2) or res_now
                     res_end = res_now
                     w_now = p.read_workers(p.grab("_watch_w2"))
@@ -472,55 +441,51 @@ def main():
                     if free_w < min_free:
                         break
             else:
-                # 没有空闲工人：开一次列表读取在建倒计时，知道什么时候来操作
                 bl = p.open_build_list()
                 if bl is not None:
-                    countdowns = read_in_progress_countdowns(bl)
+                    in_progress, _ = parse_build_list_full(bl)
                     p.clear_panels()
 
-            # 3. 计算下次需要操作的时间（最早完工的工人）
+            if args.dry:
+                p.log("[watch] dry 模式仅演示一轮即结束")
+                break
+
+            # 计算下次操作时间：取本地刚派出的完工时间 & 上半区真实在建倒计时的最小值
             now = time.time()
             next_finish_candidates = []
             for b in tracked_builds:
                 if b.get("finish_ts") and b["finish_ts"] > now:
                     next_finish_candidates.append(b["finish_ts"] - now)
-            for cd in countdowns:
-                if cd > 0:
-                    next_finish_candidates.append(float(cd))
+            for b in in_progress:
+                if b.get("remaining_s", 0) > 0:
+                    next_finish_candidates.append(float(b["remaining_s"]))
 
             remain_window = end_ts - now
-            if args.dry:
-                p.log("[watch] dry 模式仅演示一轮即结束")
-                break
-
             if next_finish_candidates:
                 earliest_s = min(next_finish_candidates)
-                wait_s = earliest_s + random.uniform(20, 45)
+                wait_s = earliest_s + random.uniform(15, 30)
                 if wait_s > remain_window:
                     eta = time.strftime("%H:%M:%S", time.localtime(now + earliest_s))
                     p.log(
                         f"[watch] 最早完工在 {dur.fmt_duration(int(earliest_s))} 后（{eta}），"
-                        f"已超出剩余值守窗口（{int(remain_window // 60)}分钟），提前收工"
+                        f"超出剩余窗口（{int(remain_window // 60)}分钟），提前收工"
                     )
                     break
                 eta = time.strftime("%H:%M:%S", time.localtime(now + wait_s))
                 p.log(
                     f"[watch] 工人已排满，最早 {dur.fmt_duration(int(earliest_s))} 后完工；"
-                    f"静默等待 {int(wait_s)}s 到 {eta} 再操作（期间不做无意义划屏，掉了自动重连）"
+                    f"静默等待 {int(wait_s)}s 到 {eta} 再操作（掉了自动重连）"
                 )
             else:
-                # 没读到倒计时（比如没钱或无短任务），默认等 12~18 分钟再看一次
-                wait_s = random.uniform(720, 1080)
+                wait_s = random.uniform(600, 900)
                 if wait_s > remain_window:
                     p.log("[watch] 剩余窗口不足以进行下一轮，收工")
                     break
                 eta = time.strftime("%H:%M:%S", time.localtime(now + wait_s))
-                p.log(f"[watch] 未检测到短期完工倒计时，等待 {int(wait_s)}s 到 {eta} 再巡检一次")
+                p.log(f"[watch] 无短期倒计时，等待 {int(wait_s)}s 到 {eta} 再检查")
 
-            # 静默等待到下次可操作时刻（不再主动划屏防掉线）
             time.sleep(wait_s)
 
-        # 结束前汇总
         if p.pid_of() is not None:
             res_end = p.read_res_vote(2) or res_end
             w_end = p.read_workers(p.grab("_watch_end"))
