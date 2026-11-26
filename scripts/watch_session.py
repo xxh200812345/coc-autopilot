@@ -197,6 +197,30 @@ def parse_build_list_full(im):
     return in_progress, items
 
 
+def is_clean_village(img, sk=None):
+    """比上游 classify() 更稳的进村判据：右上角金/水/黑任一栏(y<270)有>=5位数字 + 底栏有建造/战斗即算进村。
+    避免金币行(y<100)单帧反光没读出时，把干净村庄误判成 unknown 导致死循环重启。
+    """
+    if img is None:
+        return False
+    if sk and sk.get("kind") == "village":
+        return True
+    txt = (sk or {}).get("text", "")
+    if any(w in txt for w in LOGIN_WORDS):
+        return False
+    if any(k in txt for k in p.RECONNECT_WORDS + p.LOADING + p.AD_WORDS + p.QUIT_WORDS + p.POPUP_WORDS):
+        return False
+    tx = p.ocr_all(img)
+    bottom = [t["t"] for t in tx if t["y"] > 900]
+    if not (any("建造" in t for t in bottom) or any("战斗" in t for t in bottom)):
+        return False
+    for t in tx:
+        if t["y"] < 270 and t["x"] > 1600 and len("".join(c for c in t["t"] if c.isdigit())) >= 5:
+            return True
+    res = p.read_res(img)
+    return any(res.get(k) is not None for k in ("gold", "elixir", "dark"))
+
+
 def ensure_in_village():
     """确保游戏在前台且处于干净村庄；掉了/弹窗就重连或重启游戏。返回 'ok' | 'login' | 'fail'。"""
     if p.pid_of() is None:
@@ -204,8 +228,10 @@ def ensure_in_village():
         p.sh("input keyevent KEYCODE_WAKEUP")
         time.sleep(1.2)
         p.sh(f"am start -n {p.PKG}/{p.ACT}")
-        img = p.enter_village(max_steps=25, warmup=16)
-        return "ok" if img is not None else "fail"
+        img = p.enter_village(max_steps=20, warmup=16)
+        if img is not None or is_clean_village(p.grab("_watch_v0")):
+            return "ok"
+        return "fail"
 
     img = p.grab("_watch_chk")
     if img is not None:
@@ -214,22 +240,24 @@ def ensure_in_village():
         if any(w in txt for w in LOGIN_WORDS):
             p.log("[watch] 检测到登录/授权页，安全退出（绝不自动点登录）")
             return "login"
-        if sk.get("kind") == "village":
+        if is_clean_village(img, sk):
             if p.panel_open(img):
                 p.clear_panels()
             return "ok"
 
     p.log("[watch] 当前不在村庄（可能掉线或有弹窗），尝试恢复进村...")
-    img = p.enter_village(max_steps=18, warmup=0)
-    if img is not None:
+    img = p.enter_village(max_steps=14, warmup=0)
+    if img is not None or is_clean_village(p.grab("_watch_v1")):
         return "ok"
 
     p.log("[watch] 恢复进村失败，重启游戏再试...")
     p.sh(f"am force-stop {p.PKG}")
     time.sleep(1.5)
     p.sh(f"am start -n {p.PKG}/{p.ACT}")
-    img = p.enter_village(max_steps=25, warmup=16)
-    return "ok" if img is not None else "fail"
+    img = p.enter_village(max_steps=20, warmup=16)
+    if img is not None or is_clean_village(p.grab("_watch_v2")):
+        return "ok"
+    return "fail"
 
 
 def collect_bubbles_once(cfg, dry=False):
