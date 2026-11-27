@@ -143,10 +143,14 @@ def parse_build_list_full(im):
     bot_names = []
     bot_durs = []
     bot_prices = []
+    new_tag_ys = []
     for t in tx:
         if t["y"] < y_split:
             continue
         txt = t["t"].strip()
+        if txt == "新" and t["x"] < 1900:
+            new_tag_ys.append(t["y"])
+            continue
         if any(k in txt for k in ("临时工人", "排队建造", "建议升级")):
             continue
         sec = extract_duration_sec(txt)
@@ -165,6 +169,9 @@ def parse_build_list_full(im):
     used_durs = set()
     for price, px, py in bot_prices:
         if price < 100:
+            continue
+        # 跳过带「新」标签的未摆放新建筑（点了会进入地图摆放模式，不是升级确认框）
+        if any(abs(py - ny) < 30 for ny in new_tag_ys):
             continue
         # 价格通常在建筑名下方 15~40px，也可能与建筑名同行
         ncands = [n for n in bot_names if -15 <= (py - n["y"]) <= 48 and id(n) not in used_names]
@@ -330,15 +337,47 @@ def confirm_upgrade_now(cf, item, budget, w_start):
     return False
 
 
-def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=False, dry=False):
+def measure_live_speed_mult(ip1, t1):
+    """通过间隔 5 秒对比同一在建建筑的秒级倒计时差，自动实测真实加速倍率（如 1x / 10x）。"""
+    # 挑一个带「秒」字的在建项目（精度最高，通常是剩余 <1 小时的建筑）
+    target = next((b for b in ip1 if "秒" in b.get("raw", "") and b["remaining_s"] >= 25), None)
+    if not target:
+        return None
+    time.sleep(5.0)
+    im2 = p.grab("_watch_spd")
+    t2 = time.time()
+    if im2 is None:
+        return None
+    ip2, _ = parse_build_list_full(im2)
+    match = next((b for b in ip2 if b["name"] == target["name"] and abs(b["y"] - target["y"]) < 25), None)
+    if not match:
+        return None
+    dt = max(1.0, t2 - t1)
+    d_game = target["remaining_s"] - match["remaining_s"]
+    if d_game <= 0:
+        return None
+    ratio = d_game / dt
+    # 常见倍率吸附：0.6~1.6 -> 1x，7~13 -> 10x，其余保留一位小数
+    if 0.6 <= ratio <= 1.6:
+        return 1.0
+    if 7.0 <= ratio <= 13.0:
+        return 10.0
+    return round(max(1.0, ratio), 1)
+
+
+def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=False, dry=False, auto_speed=False):
     """从建筑列表直接按「时长 <= short_max_s 最短优先」挑一个升级。
 
-    返回 (upgraded_record_or_None, in_progress_list)。
+    返回 (upgraded_record_or_None, in_progress_list, measured_speed_or_None)。
     """
     bl = p.open_build_list()
     if bl is None:
-        return None, []
+        return None, [], None
+    t_bl = time.time()
     in_progress, items = parse_build_list_full(bl)
+    measured = measure_live_speed_mult(in_progress, t_bl) if (auto_speed and in_progress) else None
+    if measured is not None:
+        p.log(f"[watch] 自动实测当前建筑加速倍率: {measured:g}x")
     if in_progress:
         p.log(
             "[watch] 正在施工: "
@@ -347,7 +386,7 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
     if not items:
         p.clear_panels()
         p.log("[watch] 建筑列表未解析到可升级项")
-        return None, in_progress
+        return None, in_progress, measured
 
     kinds = tuple(cfg.get("upgrade_kinds") or ("gold", "elixir"))
     max_price = cfg.get("max_price")
@@ -374,7 +413,7 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
     if not pool:
         p.clear_panels()
         p.log("[watch] 无符合预算/时长条件的可升级项")
-        return None, in_progress
+        return None, in_progress, measured
 
     # 排序：<=short_max_s 最优先（按时长升序），其次按时长升序，最后按价格升序
     def _rank(it):
@@ -399,13 +438,13 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
     if dry:
         p.clear_panels()
         p.log(f"[watch] [dry] 将优先升级: {chosen['name']} ({chosen['price']:,} {chosen['kind']})")
-        return None, in_progress
+        return None, in_progress, measured
 
     cf = open_confirm_for_item(chosen)
     if cf is None:
         p.clear_panels()
         p.log(f"[watch] 未弹出 {chosen['name']} 确认框")
-        return None, in_progress
+        return None, in_progress, measured
 
     ok = confirm_upgrade_now(cf, chosen, budget, w_now)
     if ok:
@@ -416,8 +455,8 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
             kind=chosen["kind"],
             duration_s=ds,
             finish_ts=(time.time() + ds) if ds else None,
-        ), in_progress
-    return None, in_progress
+        ), in_progress, measured
+    return None, in_progress, measured
 
 
 def main():
@@ -426,38 +465,38 @@ def main():
     ap.add_argument("--jitter", type=float, default=10.0, help="总时长随机浮动分钟数（默认 ±10）")
     ap.add_argument("--short-max-min", type=float, default=30.0, help="优先短任务阈值（实际耗时分钟，默认 30）")
     ap.add_argument("--short-only", action="store_true", help="只做 <= short-max-min 的短任务，不升长任务")
-    ap.add_argument("--speed-mult", type=float, default=1.0, help="建筑加速倍率（如工人药水=10，默认 1.0）")
-    ap.add_argument("--boost-minutes", type=float, default=0.0, help="加速持续分钟数（0=全程有效；如1瓶工人药水=60，到期后自动恢复1x）")
+    ap.add_argument("--speed-mult", type=float, default=0.0, help="建筑加速倍率（0=自动5秒实测，如工人药水会自动测出10x；也可手动指定如 1 / 10）")
+    ap.add_argument("--boost-minutes", type=float, default=0.0, help="手动加速持续分钟数（0=自动随实测动态切换）")
     ap.add_argument("--dry", action="store_true", help="只读演练，不点击确认")
     ap.add_argument("--keep-game", action="store_true", help="结束时不强杀游戏")
     args = ap.parse_args()
 
     cfg = coc_config.load()
-    speed_mult = max(1.0, float(args.speed_mult))
+    auto_speed = (float(args.speed_mult) <= 0.0)
+    speed_mult = 1.0 if auto_speed else max(1.0, float(args.speed_mult))
     short_max_s = int(args.short_max_min * 60)
     total_min = max(1.0, args.minutes + random.uniform(-args.jitter, args.jitter))
     t0 = time.time()
     end_ts = t0 + total_min * 60
-    boost_end_ts = (t0 + args.boost_minutes * 60) if (speed_mult > 1.0 and args.boost_minutes > 0) else None
+    boost_end_ts = (t0 + args.boost_minutes * 60) if (not auto_speed and speed_mult > 1.0 and args.boost_minutes > 0) else None
 
-    def real_seconds_for(game_sec, now_ts):
-        """把游戏标称剩余秒数换算为真实等待秒数（支持工人药水加速及到期后自动切回 1x）。"""
+    def real_seconds_for(game_sec, now_ts, cur_mult_val):
+        """把游戏标称剩余秒数换算为真实等待秒数（支持自动实测加速或手动定时加速）。"""
         if game_sec is None or game_sec <= 0:
             return None
-        if speed_mult <= 1.0:
+        if cur_mult_val <= 1.0:
             return float(game_sec)
         if boost_end_ts is None:
-            return float(game_sec) / speed_mult
+            return float(game_sec) / cur_mult_val
         boost_rem = max(0.0, boost_end_ts - now_ts)
         if boost_rem <= 0:
             return float(game_sec)
-        # 在剩余加速时间内能消耗掉的游戏工时
-        game_done_in_boost = boost_rem * speed_mult
+        game_done_in_boost = boost_rem * cur_mult_val
         if game_sec <= game_done_in_boost:
-            return float(game_sec) / speed_mult
+            return float(game_sec) / cur_mult_val
         return boost_rem + float(game_sec - game_done_in_boost)
 
-    boost_desc = f"{speed_mult:g}x" + (f"(持续{int(args.boost_minutes)}分)" if boost_end_ts else "(全程)")
+    boost_desc = "自动实测" if auto_speed else (f"{speed_mult:g}x" + (f"(持续{int(args.boost_minutes)}分)" if boost_end_ts else "(全程)"))
     p.log(
         f"[watch] 启动智能排程值守: 窗口={total_min:.1f}分钟 加速={boost_desc} "
         f"短任务优先(实际<={int(args.short_max_min)}分钟) short_only={args.short_only} dry={args.dry}"
@@ -497,30 +536,34 @@ def main():
 
             in_progress = []
             min_free = int(cfg.get("min_free_workers") or 1)
-            # 加速生效期间，游戏标称时长按当前倍率换算：实际 <= short_max_s 的都算短任务
             cur_mult = speed_mult if (boost_end_ts is None or time.time() < boost_end_ts) else 1.0
             eff_short_max_s = int(short_max_s * cur_mult)
             if cfg.get("upgrade", True) and free_w >= min_free:
                 for _slot in range(free_w):
                     if time.time() >= end_ts:
                         break
-                    rec, ip = pick_and_upgrade_short_first(
+                    rec, ip, measured = pick_and_upgrade_short_first(
                         cfg, res_now, w_now, eff_short_max_s,
                         short_only=args.short_only, dry=args.dry,
+                        auto_speed=(auto_speed and _slot == 0),
                     )
+                    if auto_speed and measured is not None:
+                        speed_mult = measured
+                        cur_mult = measured
+                        eff_short_max_s = int(short_max_s * cur_mult)
                     if ip:
                         in_progress = ip
                     if not rec:
                         break
                     total_upgrades.append(rec)
                     if rec.get("duration_s"):
-                        rs = real_seconds_for(rec["duration_s"], time.time())
+                        rs = real_seconds_for(rec["duration_s"], time.time(), cur_mult)
                         rec["finish_ts"] = time.time() + rs
                         tracked_builds.append(rec)
                         eta = time.strftime("%H:%M:%S", time.localtime(rec["finish_ts"]))
                         p.log(
                             f"[watch] 已记排程: {rec['name']} 标称={dur.fmt_duration(rec['duration_s'])} "
-                            f"实际≈{dur.fmt_duration(int(rs))} 预计 {eta} 完工"
+                            f"实际≈{dur.fmt_duration(int(rs))} ({cur_mult:g}x) 预计 {eta} 完工"
                         )
                     if args.dry:
                         break
@@ -533,7 +576,14 @@ def main():
             else:
                 bl = p.open_build_list()
                 if bl is not None:
+                    t_bl = time.time()
                     in_progress, _ = parse_build_list_full(bl)
+                    if auto_speed and in_progress:
+                        measured = measure_live_speed_mult(in_progress, t_bl)
+                        if measured is not None:
+                            speed_mult = measured
+                            cur_mult = measured
+                            p.log(f"[watch] 自动实测当前建筑加速倍率: {measured:g}x")
                     p.clear_panels()
 
             if args.dry:
@@ -548,7 +598,7 @@ def main():
                     next_finish_candidates.append(b["finish_ts"] - now)
             for b in in_progress:
                 if b.get("remaining_s", 0) > 0:
-                    rs = real_seconds_for(b["remaining_s"], now)
+                    rs = real_seconds_for(b["remaining_s"], now, cur_mult)
                     if rs and rs > 0:
                         next_finish_candidates.append(float(rs))
 

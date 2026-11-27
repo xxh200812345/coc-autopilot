@@ -2,7 +2,7 @@
     [double]$Minutes = 120,
     [double]$Jitter = 10,
     [double]$ShortMaxMin = 30,
-    [double]$SpeedMult = 1,
+    [double]$SpeedMult = 0,
     [double]$BoostMinutes = 0,
     [switch]$ShortOnly,
     [int]$VmIndex = 0,
