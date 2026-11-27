@@ -424,21 +424,43 @@ def main():
     ap = argparse.ArgumentParser(description="CoC 智能工人排程值守（优先做完 <=10 分钟短任务，按完工时间精准操作）")
     ap.add_argument("--minutes", type=float, default=120.0, help="总值守窗口（分钟，默认 120）")
     ap.add_argument("--jitter", type=float, default=10.0, help="总时长随机浮动分钟数（默认 ±10）")
-    ap.add_argument("--short-max-min", type=float, default=30.0, help="优先短任务阈值（分钟，默认 30）")
+    ap.add_argument("--short-max-min", type=float, default=30.0, help="优先短任务阈值（实际耗时分钟，默认 30）")
     ap.add_argument("--short-only", action="store_true", help="只做 <= short-max-min 的短任务，不升长任务")
+    ap.add_argument("--speed-mult", type=float, default=1.0, help="建筑加速倍率（如工人药水=10，默认 1.0）")
+    ap.add_argument("--boost-minutes", type=float, default=0.0, help="加速持续分钟数（0=全程有效；如1瓶工人药水=60，到期后自动恢复1x）")
     ap.add_argument("--dry", action="store_true", help="只读演练，不点击确认")
     ap.add_argument("--keep-game", action="store_true", help="结束时不强杀游戏")
     args = ap.parse_args()
 
     cfg = coc_config.load()
+    speed_mult = max(1.0, float(args.speed_mult))
     short_max_s = int(args.short_max_min * 60)
     total_min = max(1.0, args.minutes + random.uniform(-args.jitter, args.jitter))
     t0 = time.time()
     end_ts = t0 + total_min * 60
+    boost_end_ts = (t0 + args.boost_minutes * 60) if (speed_mult > 1.0 and args.boost_minutes > 0) else None
 
+    def real_seconds_for(game_sec, now_ts):
+        """把游戏标称剩余秒数换算为真实等待秒数（支持工人药水加速及到期后自动切回 1x）。"""
+        if game_sec is None or game_sec <= 0:
+            return None
+        if speed_mult <= 1.0:
+            return float(game_sec)
+        if boost_end_ts is None:
+            return float(game_sec) / speed_mult
+        boost_rem = max(0.0, boost_end_ts - now_ts)
+        if boost_rem <= 0:
+            return float(game_sec)
+        # 在剩余加速时间内能消耗掉的游戏工时
+        game_done_in_boost = boost_rem * speed_mult
+        if game_sec <= game_done_in_boost:
+            return float(game_sec) / speed_mult
+        return boost_rem + float(game_sec - game_done_in_boost)
+
+    boost_desc = f"{speed_mult:g}x" + (f"(持续{int(args.boost_minutes)}分)" if boost_end_ts else "(全程)")
     p.log(
-        f"[watch] 启动智能排程值守: 窗口={total_min:.1f}分钟 "
-        f"短任务优先<={int(args.short_max_min)}分钟 short_only={args.short_only} dry={args.dry}"
+        f"[watch] 启动智能排程值守: 窗口={total_min:.1f}分钟 加速={boost_desc} "
+        f"短任务优先(实际<={int(args.short_max_min)}分钟) short_only={args.short_only} dry={args.dry}"
     )
     init_capture_smart()
 
@@ -475,12 +497,15 @@ def main():
 
             in_progress = []
             min_free = int(cfg.get("min_free_workers") or 1)
+            # 加速生效期间，游戏标称时长按当前倍率换算：实际 <= short_max_s 的都算短任务
+            cur_mult = speed_mult if (boost_end_ts is None or time.time() < boost_end_ts) else 1.0
+            eff_short_max_s = int(short_max_s * cur_mult)
             if cfg.get("upgrade", True) and free_w >= min_free:
                 for _slot in range(free_w):
                     if time.time() >= end_ts:
                         break
                     rec, ip = pick_and_upgrade_short_first(
-                        cfg, res_now, w_now, short_max_s,
+                        cfg, res_now, w_now, eff_short_max_s,
                         short_only=args.short_only, dry=args.dry,
                     )
                     if ip:
@@ -488,10 +513,15 @@ def main():
                     if not rec:
                         break
                     total_upgrades.append(rec)
-                    if rec.get("finish_ts"):
+                    if rec.get("duration_s"):
+                        rs = real_seconds_for(rec["duration_s"], time.time())
+                        rec["finish_ts"] = time.time() + rs
                         tracked_builds.append(rec)
                         eta = time.strftime("%H:%M:%S", time.localtime(rec["finish_ts"]))
-                        p.log(f"[watch] 已记排程: {rec['name']} 预计 {eta} 完工")
+                        p.log(
+                            f"[watch] 已记排程: {rec['name']} 标称={dur.fmt_duration(rec['duration_s'])} "
+                            f"实际≈{dur.fmt_duration(int(rs))} 预计 {eta} 完工"
+                        )
                     if args.dry:
                         break
                     res_now = p.read_res_vote(2) or res_now
@@ -510,7 +540,7 @@ def main():
                 p.log("[watch] dry 模式仅演示一轮即结束")
                 break
 
-            # 计算下次操作时间：取本地刚派出的完工时间 & 上半区真实在建倒计时的最小值
+            # 计算下次操作时间：取本地刚派出的真实完工时间 & 上半区在建倒计时(按加速倍率换算)的最小值
             now = time.time()
             next_finish_candidates = []
             for b in tracked_builds:
@@ -518,12 +548,15 @@ def main():
                     next_finish_candidates.append(b["finish_ts"] - now)
             for b in in_progress:
                 if b.get("remaining_s", 0) > 0:
-                    next_finish_candidates.append(float(b["remaining_s"]))
+                    rs = real_seconds_for(b["remaining_s"], now)
+                    if rs and rs > 0:
+                        next_finish_candidates.append(float(rs))
 
             remain_window = end_ts - now
             if next_finish_candidates:
                 earliest_s = min(next_finish_candidates)
-                wait_s = earliest_s + random.uniform(15, 30)
+                buf = random.uniform(10, 20) if cur_mult > 1.0 else random.uniform(15, 30)
+                wait_s = max(12.0, earliest_s + buf)
                 if wait_s > remain_window:
                     eta = time.strftime("%H:%M:%S", time.localtime(now + earliest_s))
                     p.log(

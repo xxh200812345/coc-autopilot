@@ -2,6 +2,8 @@
     [double]$Minutes = 120,
     [double]$Jitter = 10,
     [double]$ShortMaxMin = 30,
+    [double]$SpeedMult = 1,
+    [double]$BoostMinutes = 0,
     [switch]$ShortOnly,
     [int]$VmIndex = 0,
     [switch]$Dry,
@@ -178,7 +180,7 @@ try {
         Write-Log "检测到游戏已在运行 (pid=$gamePid)，直接接管开始值守"
     }
     Start-Sleep -Seconds 2
-    $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter", "--short-max-min", "$ShortMaxMin")
+    $pyArgs = @($WatchPy, "--minutes", "$Minutes", "--jitter", "$Jitter", "--short-max-min", "$ShortMaxMin", "--speed-mult", "$SpeedMult", "--boost-minutes", "$BoostMinutes")
     if ($ShortOnly) { $pyArgs += "--short-only" }
     if ($Dry) { $pyArgs += "--dry" }
     if ($KeepGame) { $pyArgs += "--keep-game" }
