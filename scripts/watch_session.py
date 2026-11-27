@@ -365,8 +365,8 @@ def measure_live_speed_mult(ip1, t1):
     return round(max(1.0, ratio), 1)
 
 
-def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=False, dry=False, auto_speed=False):
-    """从建筑列表直接按「时长 <= short_max_s 最短优先」挑一个升级。
+def pick_and_upgrade_short_first(cfg, res_now, w_now, real_short_max_s, cur_mult=1.0, short_only=False, dry=False, auto_speed=False):
+    """从建筑列表直接按「换算成现实耗时 <= real_short_max_s（默认30分钟）最短优先」挑一个升级。
 
     返回 (upgraded_record_or_None, in_progress_list, measured_speed_or_None)。
     """
@@ -376,8 +376,10 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
     t_bl = time.time()
     in_progress, items = parse_build_list_full(bl)
     measured = measure_live_speed_mult(in_progress, t_bl) if (auto_speed and in_progress) else None
+    eff_mult = measured if measured is not None else max(1.0, float(cur_mult))
+    eff_game_max_s = int(real_short_max_s * eff_mult)
     if measured is not None:
-        p.log(f"[watch] 自动实测当前建筑加速倍率: {measured:g}x")
+        p.log(f"[watch] 自动实测当前建筑加速倍率: {measured:g}x（现实<={real_short_max_s // 60}分 = 标称<={dur.fmt_duration(eff_game_max_s)}）")
     if in_progress:
         p.log(
             "[watch] 正在施工: "
@@ -406,30 +408,35 @@ def pick_and_upgrade_short_first(cfg, res_now, w_now, short_max_s, short_only=Fa
             continue
         if it["price"] > budget.get(it["kind"], 0) * 0.95:
             continue
-        if short_only and (it["duration_s"] is None or it["duration_s"] > short_max_s):
+        real_s = (it["duration_s"] / eff_mult) if it["duration_s"] else None
+        if short_only and (real_s is None or real_s > real_short_max_s):
             continue
-        pool.append(it)
+        it_c = dict(it)
+        it_c["real_s"] = real_s
+        pool.append(it_c)
 
     if not pool:
         p.clear_panels()
         p.log("[watch] 无符合预算/时长条件的可升级项")
         return None, in_progress, measured
 
-    # 排序：<=short_max_s 最优先（按时长升序），其次按时长升序，最后按价格升序
+    # 排序：现实耗时 <= real_short_max_s 最优先（按现实耗时升序），其次按现实耗时升序，最后按价格升序
     def _rank(it):
-        ds = it["duration_s"]
-        if ds is not None and ds <= short_max_s:
-            return (0, ds, it["price"])
-        if ds is not None:
-            return (1, ds, it["price"])
+        rs = it["real_s"]
+        if rs is not None and rs <= real_short_max_s:
+            return (0, rs, it["price"])
+        if rs is not None:
+            return (1, rs, it["price"])
         return (2, it["price"], 0)
 
     pool.sort(key=_rank)
     p.log(
-        "[watch] 可升级候选(短任务优先): "
+        "[watch] 可升级候选(按现实耗时由低到高): "
         + ", ".join(
             f"{i['name']}({i['price']:,},{i['kind']},"
-            f"{dur.fmt_duration(i['duration_s']) if i['duration_s'] else '?'})"
+            f"标称{dur.fmt_duration(i['duration_s']) if i['duration_s'] else '?'}"
+            + (f"/现实{dur.fmt_duration(int(i['real_s']))}" if (eff_mult > 1.0 and i["real_s"]) else "")
+            + ")"
             for i in pool[:5]
         )
     )
@@ -537,20 +544,19 @@ def main():
             in_progress = []
             min_free = int(cfg.get("min_free_workers") or 1)
             cur_mult = speed_mult if (boost_end_ts is None or time.time() < boost_end_ts) else 1.0
-            eff_short_max_s = int(short_max_s * cur_mult)
             if cfg.get("upgrade", True) and free_w >= min_free:
                 for _slot in range(free_w):
                     if time.time() >= end_ts:
                         break
                     rec, ip, measured = pick_and_upgrade_short_first(
-                        cfg, res_now, w_now, eff_short_max_s,
+                        cfg, res_now, w_now, short_max_s,
+                        cur_mult=cur_mult,
                         short_only=args.short_only, dry=args.dry,
                         auto_speed=(auto_speed and _slot == 0),
                     )
                     if auto_speed and measured is not None:
                         speed_mult = measured
                         cur_mult = measured
-                        eff_short_max_s = int(short_max_s * cur_mult)
                     if ip:
                         in_progress = ip
                     if not rec:
